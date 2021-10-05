@@ -1,8 +1,7 @@
 #ifndef XDPCAP_HOOK_H
 #define XDPCAP_HOOK_H
 
-#include "headers/common.h"
-#include "headers/bpf_helpers.h"
+#include "bpf_helpers.h"
 
 /**
  * Create a bpf map suitable for use as an xdpcap hook point.
@@ -11,7 +10,7 @@
  *   struct bpf_map_def xdpcap_hook = XDPCAP_HOOK();
  */
 #define XDPCAP_HOOK() { \
-	.type = BPF_MAP_TYPE_PROG_ARRAY, \
+	.map_type = BPF_MAP_TYPE_PROG_ARRAY, \
 	.key_size = sizeof(int), \
 	.value_size = sizeof(int), \
 	.max_entries = 5, \
