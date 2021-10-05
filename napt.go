@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"io/ioutil"
 	"net"
 	"os"
 	"os/signal"
@@ -36,6 +37,7 @@ type NaptCollect struct {
 	PeerPortMap *ebpf.Map `ebpf:"peer_port"`
 	PortPeerMap *ebpf.Map `ebpf:"port_peer"`
 	Entries *ebpf.Map `ebpf:"entries"`
+	XdpcpHook *ebpf.Map `ebpf:"xdpcap_hook"`
 }
 
 func newNapt(in, out, global, local string) (*Napt, error) {
@@ -56,6 +58,25 @@ func newNapt(in, out, global, local string) (*Napt, error) {
 	if err := spec.LoadAndAssign(collect, nil); err != nil {
 		return nil, err
 	}
+	// pinPath, err := ioutil.TempDir("/sys/fs/bpf", "napt")
+	// if err != nil {
+	// 	return nil, err
+	// }
+	// fmt.Println("pin path - ", pinPath)
+	// xdpcapSpec := &ebpf.MapSpec{
+	// 	Name: "xdpcap_hook",
+	// 	Type: ebpf.ProgramArray,
+	// 	KeySize: 4,
+	// 	ValueSize: 4,
+	// 	MaxEntries: 5,
+	// 	Pinning: ebpf.PinByName,
+	// }
+	// xdpcapHookMap, err := ebpf.NewMapWithOptions(xdpcapSpec, ebpf.MapOptions{ PinPath: pinPath})
+	// if err != nil {
+	// 	fmt.Println("error at creating xdpcap hook map.")
+	// 	return nil, err
+	// }
+	// collect.XdpcpHook = xdpcapHookMap
 	return &Napt {
 		in: inL,
 		out: outL,
@@ -98,6 +119,9 @@ func (n *Napt) Attach() error {
 		return err
 	}
 	if err := attach(n.collect.Prog, n.out); err != nil {
+		return err
+	}
+	if err := n.collect.XdpcpHook.Pin("/sys/fs/bpf/napt"); err != nil {
 		return err
 	}
 	return nil

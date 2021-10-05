@@ -67,7 +67,14 @@ BPF_MAP_DEF(port_peer) = {
 };
 BPF_MAP_ADD(port_peer);
 
-struct bpf_map_def xdpcap_hook = XDPCAP_HOOK();
+
+BPF_MAP_DEF(xdpcap_hook) = {
+	.map_type = BPF_MAP_TYPE_PROG_ARRAY,
+	.key_size = sizeof(int),
+	.value_size = sizeof(int),
+	.max_entries = 5,
+};
+BPF_MAP_ADD(xdpcap_hook);
 
 struct arphdr {
 	__u16 ar_hrd;
@@ -284,9 +291,9 @@ int nat_prog(struct xdp_md *ctx) {
 				bpf_printk("smac %x:%x", eth->h_source[0], eth->h_source[5]);
 				bpf_printk("ip src %d", ip->saddr);
 				bpf_printk("sent from global interface(%d).", *out_ifindex);
-				// int action = bpf_redirect_map(&if_redirect, *out_ifindex, 0);
-				// action = xdpcap_exit(ctx, &xdpcap_hook, action);
-				return bpf_redirect_map(&if_redirect, *out_ifindex, 0);
+				int action = bpf_redirect_map(&if_redirect, *out_ifindex, 0);
+				return xdpcap_exit(ctx, &xdpcap_hook, action);
+				// return bpf_redirect_map(&if_redirect, *out_ifindex, 0);
 				// bpf_printk("action %d", action);
 				// return action;
 			}
