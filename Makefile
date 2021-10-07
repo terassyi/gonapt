@@ -18,3 +18,4 @@ build:
 clean:
 	$(GOCLEAN)
 	rm $(AUTO_GEN)
+	sudo rm -rf /sys/fs/bpf/napt

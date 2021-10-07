@@ -1,4 +1,5 @@
 #include <linux/if_ether.h>
+#include <netinet/in.h>
 #include <netinet/ip.h>
 #include <netinet/ip_icmp.h>
 #include <netinet/tcp.h>
@@ -159,6 +160,12 @@ static inline __u16 checksum2(__u8 *data1, int len1, __u8 *data2, int len2) {
 	return ~sum;
 }
 
+static inline __u16 update_csum_u16(__u16 old_sum, __u16 old_data, __u16 new_data) {
+	__u32 new_sum = old_sum - ~old_data - new_data;
+	bpf_printk("new_sum %x", new_sum);
+	return new_sum;
+}
+
 
 SEC("xdp")
 int nat_prog(struct xdp_md *ctx) {
@@ -172,7 +179,14 @@ int nat_prog(struct xdp_md *ctx) {
 	if (!in_ifindex || !out_ifindex) {
 		return XDP_PASS;
 	}
-	bpf_printk("in = %d out = %d", *in_ifindex, *out_ifindex);
+	__u32 *in = bpf_map_lookup_elem(&if_redirect, in_ifindex);
+	__u32 *out = bpf_map_lookup_elem(&if_redirect, out_ifindex);
+	if (!in || !out) {
+		bpf_printk("failed to get from if_redirect");
+		return XDP_PASS;
+	}
+	bpf_printk("in = %d out = %d", *in, *out);
+
 	__u8 *in_mac = bpf_map_lookup_elem(&if_mac, in_ifindex);
 	if (!in_mac) {
 		bpf_printk("failed to get in mac addr.");
@@ -273,13 +287,23 @@ int nat_prog(struct xdp_md *ctx) {
 				} else {
 					// already registered.
 					alloced_ident = *res;
-					bpf_printk("peer already registered.");
 				}
 				// change ident field
-				bpf_printk("allocated ident = %d", alloced_ident);
-				icmp->un.echo.id = alloced_ident;
-				icmp->checksum = 0;
-				icmp->checksum = checksum((__u16 *)icmp, sizeof(*icmp));
+				__u16 old_ident = icmp->un.echo.id;
+				icmp->un.echo.id = htons(alloced_ident);
+				// icmp->checksum = 0;
+				__u32 new = ~(__u32)ntohs(icmp->checksum) + ~(__u32)ntohs(old_ident) + (__u32)alloced_ident;
+				new = ~new;
+				if (new > 0xffff0000) {
+					new = (new & 0xffff) - 2;
+					bpf_printk("->");
+				} else {
+					new--;
+				}
+				icmp->checksum = htons((__u16)new);
+				bpf_printk("icmp checksum new = %x", new);
+				// icmp->checksum = ()
+				// icmp->checksum = update_csum_u16(icmp->checksum, old_ident, htons(alloced_ident));
 				// change ip field
 				ip->saddr = *global_addr;
 				ip->check = 0;
@@ -287,10 +311,10 @@ int nat_prog(struct xdp_md *ctx) {
 				__builtin_memcpy(eth->h_dest, fib_params.dmac, ETH_ALEN);
 				__builtin_memcpy(eth->h_source, fib_params.smac, ETH_ALEN);
 
-				bpf_printk("dmac %x:%x", eth->h_dest[0], eth->h_dest[5]);
-				bpf_printk("smac %x:%x", eth->h_source[0], eth->h_source[5]);
-				bpf_printk("ip src %d", ip->saddr);
-				bpf_printk("sent from global interface(%d).", *out_ifindex);
+				// bpf_printk("dmac %x:%x", eth->h_dest[0], eth->h_dest[5]);
+				// bpf_printk("smac %x:%x", eth->h_source[0], eth->h_source[5]);
+				// bpf_printk("ip src %d", ip->saddr);
+				// bpf_printk("sent from global interface(%d).", *out_ifindex);
 				int action = bpf_redirect_map(&if_redirect, *out_ifindex, 0);
 				return xdpcap_exit(ctx, &xdpcap_hook, action);
 				// return bpf_redirect_map(&if_redirect, *out_ifindex, 0);
@@ -306,20 +330,26 @@ int nat_prog(struct xdp_md *ctx) {
 			if (data + sizeof(*tcp) > data_end) {
 				return XDP_DROP;
 			}
-			struct peer p;
-			p.addr = ip->saddr;
-			p.port = tcp->source;
-			if (bpf_map_lookup_elem(&peer_port, &p) != 0) {
-				// already registered.
-				bpf_printk("peer already registered.");
-			} else {
-				// new peer
-				__u16 port = alloc_port();
-				if (bpf_map_update_elem(&peer_port, &p, &port, 0) != 0) {
-					bpf_printk("failed to register.");
-				}
-			}
+			// struct peer p;
+			// p.addr = ip->saddr;
+			// p.port = tcp->source;
+			// if (bpf_map_lookup_elem(&peer_port, &p) != 0) {
+			// 	// already registered.
+			// 	bpf_printk("peer already registered.");
+			// } else {
+			// 	// new peer
+			// 	__u16 port = alloc_port();
+			// 	if (bpf_map_update_elem(&peer_port, &p, &port, 0) != 0) {
+			// 		bpf_printk("failed to register.");
+			// 	}
+			// }
 			bpf_printk("tcp");
+			__builtin_memcpy(eth->h_dest, fib_params.dmac, ETH_ALEN);
+			__builtin_memcpy(eth->h_source, fib_params.smac, ETH_ALEN);
+			int action = bpf_redirect_map(&if_redirect, *out_ifindex, 0);
+			bpf_printk("action = %d", action);
+			return xdpcap_exit(ctx, &xdpcap_hook, action);
+
 		} else if (ip->protocol == 0x11) {
 			// udp
 			struct udphdr *udp = data;
