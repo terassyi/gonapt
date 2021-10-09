@@ -120,9 +120,9 @@ func (n *Napt) Attach() error {
 	if err := attach(n.collect.Prog, n.out); err != nil {
 		return err
 	}
-	if err := n.collect.XdpcpHook.Pin("/sys/fs/bpf/napt"); err != nil {
-		return err
-	}
+	// if err := n.collect.XdpcpHook.Pin("/sys/fs/bpf/napt"); err != nil {
+	// 	return err
+	// }
 	return nil
 }
 
@@ -175,14 +175,18 @@ func (n *Napt) Prepare() error {
 
 func (n *Napt) Check() error {
 	var (
-		key [6]byte
-		value uint16
+		key uint16
+		value [21]byte
 	)
 
-	iter := n.collect.PeerPortMap.Iterate()
+	iter := n.collect.Entries.Iterate()
 	for iter.Next(&key, &value) {
-		p := peerFromBytes(key)
-		fmt.Printf("%s:%d => %d\n", p.addr, p.port, value)
+		entry, err := entryFromBytes(value)
+		if err != nil {
+			return err
+		}
+		entry.global = key
+		fmt.Println(entry.String())
 	}
 	fmt.Println("finished iterating")
 	return nil

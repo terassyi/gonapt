@@ -47,7 +47,7 @@ BPF_MAP_ADD(if_mac);
 BPF_MAP_DEF(entries) = {
 	.map_type = BPF_MAP_TYPE_HASH,
 	.key_size = sizeof(__u16),
-	.value_size = sizeof(__u32),
+	.value_size = sizeof(__u8) * 21,
 	.max_entries = 1024,
 };
 BPF_MAP_ADD(entries);
@@ -92,6 +92,14 @@ struct arphdr {
 struct peer {
 	__u32 addr;
 	__u16 port;
+};
+
+struct entry {
+	__u32 addr;
+	__u16 port;
+	__u8 protocol;
+	__u8 mac_addr[6];
+	__u64 timespamp;
 };
 
 __u16 alloc_port();
@@ -188,8 +196,9 @@ int nat_prog(struct xdp_md *ctx) {
 	bpf_printk("in = %d out = %d", *in, *out);
 
 	__u8 *in_mac = bpf_map_lookup_elem(&if_mac, in_ifindex);
-	if (!in_mac) {
-		bpf_printk("failed to get in mac addr.");
+	__u8 *out_mac = bpf_map_lookup_elem(&if_mac, out_ifindex);
+	if (!in_mac || !out_mac) {
+		bpf_printk("failed to get in or out mac addr.");
 		return XDP_PASS;
 	}
 	__u32 *global_addr = bpf_map_lookup_elem(&if_addr, out_ifindex);
@@ -308,6 +317,19 @@ int nat_prog(struct xdp_md *ctx) {
 				ip->saddr = *global_addr;
 				ip->check = 0;
 				ip->check = checksum((__u16 *)ip, sizeof(*ip));
+
+				struct entry ent;
+				__builtin_memset(&ent, 0, sizeof(ent));
+				ent.addr = p.addr;
+				ent.port = p.port;
+				ent.protocol = ip->protocol;
+				__builtin_memcpy(&ent.mac_addr, eth->h_source, 6);
+				ent.timespamp = bpf_ktime_get_ns();
+				if (bpf_map_update_elem(&entries, &alloced_ident, &ent, 0) != 0) {
+					bpf_printk("failed to update entries.");
+					return XDP_PASS;
+				}
+
 				__builtin_memcpy(eth->h_dest, fib_params.dmac, ETH_ALEN);
 				__builtin_memcpy(eth->h_source, fib_params.smac, ETH_ALEN);
 
@@ -315,8 +337,8 @@ int nat_prog(struct xdp_md *ctx) {
 				// bpf_printk("smac %x:%x", eth->h_source[0], eth->h_source[5]);
 				// bpf_printk("ip src %d", ip->saddr);
 				// bpf_printk("sent from global interface(%d).", *out_ifindex);
-				int action = bpf_redirect_map(&if_redirect, *out_ifindex, 0);
-				return xdpcap_exit(ctx, &xdpcap_hook, action);
+				return bpf_redirect_map(&if_redirect, *out_ifindex, 0);
+				// return xdpcap_exit(ctx, &xdpcap_hook, action);
 				// return bpf_redirect_map(&if_redirect, *out_ifindex, 0);
 				// bpf_printk("action %d", action);
 				// return action;
@@ -346,9 +368,8 @@ int nat_prog(struct xdp_md *ctx) {
 			bpf_printk("tcp");
 			__builtin_memcpy(eth->h_dest, fib_params.dmac, ETH_ALEN);
 			__builtin_memcpy(eth->h_source, fib_params.smac, ETH_ALEN);
-			int action = bpf_redirect_map(&if_redirect, *out_ifindex, 0);
-			bpf_printk("action = %d", action);
-			return xdpcap_exit(ctx, &xdpcap_hook, action);
+			return bpf_redirect_map(&if_redirect, *out_ifindex, 0);
+			// return xdpcap_exit(ctx, &xdpcap_hook, action);
 
 		} else if (ip->protocol == 0x11) {
 			// udp
@@ -377,8 +398,49 @@ int nat_prog(struct xdp_md *ctx) {
 	} else {
 		// out
 		if (ip->protocol == 0x01) {
-			bpf_printk("egress icmp");
 			// icmp
+			struct icmphdr *icmp = data;
+			if (data + sizeof(*icmp) > data_end) {
+				return XDP_DROP;
+			}
+			if (icmp->type == 0 || icmp->type == 8) {
+				// echo request or reply
+				__u16 ident = ntohs(icmp->un.echo.id);
+				__u8 *res = bpf_map_lookup_elem(&entries, &ident);
+				if (!res) {
+					bpf_printk("peer infomation is not registered.");
+					return XDP_PASS;
+				}
+				struct entry *ent = (void *)res;
+				// change ident field
+				__u16 old_ident = icmp->un.echo.id;
+				icmp->un.echo.id = htons(ent->port);
+				// icmp->checksum = 0;
+				__u32 new = ~(__u32)ntohs(icmp->checksum) + ~(__u32)ntohs(old_ident) + (__u32)ent->port;
+				new = ~new;
+				if (new > 0xffff0000) {
+					new = (new & 0xffff) - 2;
+				} else {
+					new--;
+				}
+				icmp->checksum = htons((__u16)new);
+				bpf_printk("icmp checksum new = %x", new);
+				// icmp->checksum = ()
+				// icmp->checksum = update_csum_u16(icmp->checksum, old_ident, htons(alloced_ident));
+				// change ip field
+				ip->daddr = ent->addr;
+				ip->check = 0;
+				ip->check = checksum((__u16 *)ip, sizeof(*ip));
+
+				__builtin_memcpy(eth->h_source, out_mac, ETH_ALEN);
+				__builtin_memcpy(eth->h_dest, ent->mac_addr, ETH_ALEN);
+				bpf_printk("out dmac %x:%x", eth->h_dest[0], eth->h_dest[5]);
+				bpf_printk("out smac %x:%x", eth->h_source[0], eth->h_source[5]);
+				// bpf_printk("ip src %d", ip->saddr);
+				// bpf_printk("sent from global interface(%d).", *out_ifindex);
+				
+				return bpf_redirect_map(&if_redirect, *in_ifindex, 0);
+			}
 
 		} else if (ip->protocol == 0x06) {
 			// tcp
@@ -403,4 +465,5 @@ __u16 alloc_port() {
 	}
 	return port;
 }
+
 char __license[] SEC("license") = "GPL";
