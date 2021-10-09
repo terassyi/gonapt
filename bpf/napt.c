@@ -174,6 +174,62 @@ static inline __u16 update_csum_u16(__u16 old_sum, __u16 old_data, __u16 new_dat
 	return new_sum;
 }
 
+static inline int proxy_arp(struct arphdr *arp, struct ethhdr *eth, __u8 *mac_addr, __u32 *global_addr) {
+	if (arp->ar_hrd != 0x0100 || arp->ar_pro != 0x08) {
+		return XDP_PASS;
+	}
+	if (arp->ar_op != 0x100) {
+		return XDP_PASS;
+	}
+	// build reply
+	arp->ar_op = 0x0200;
+	arp->ar_hrd = 0x0100;
+	arp->ar_pro = 0x08;
+	arp->ar_hln = ETH_ALEN;
+	arp->ar_pln = 4;
+	__builtin_memcpy(arp->ar_tha, arp->ar_sha, ETH_ALEN);
+	__builtin_memcpy(arp->ar_sha, mac_addr, ETH_ALEN);
+	__builtin_memcpy(global_addr, arp->ar_tip, 4);
+	__builtin_memcpy(arp->ar_tip, arp->ar_sip, 4);
+	__builtin_memcpy(arp->ar_sip, global_addr, 4);
+
+	__builtin_memcpy(eth->h_dest, arp->ar_tha, ETH_ALEN);
+	__builtin_memcpy(eth->h_source, mac_addr, ETH_ALEN);
+	return XDP_TX;
+}
+
+static inline int lookup_route_table(struct xdp_md *ctx, struct bpf_fib_lookup *fib_params, struct iphdr *ip, __u32 ifindex) {
+	__builtin_memset(fib_params, 0, sizeof(*fib_params));
+	fib_params->family = AF_INET;
+	fib_params->ipv4_src = ip->saddr;
+	fib_params->ipv4_dst = ip->daddr;
+	fib_params->ifindex = ifindex;
+	int rc = bpf_fib_lookup(ctx, fib_params, sizeof(*fib_params), 0);
+	if ((rc != BPF_FIB_LKUP_RET_SUCCESS) && (rc != BPF_FIB_LKUP_RET_NO_NEIGH)) {
+		bpf_printk("fib lookup failed.");
+		return -1;
+	} else if (rc == BPF_FIB_LKUP_RET_NO_NEIGH) {
+		bpf_printk("fib lookup result is no neigh.");
+		return -1;
+	}
+	return 0;
+}
+
+static inline __u16 lookup_entry(struct peer p) {
+	__u16 alloced_ident = 0;
+	__u16 *res = bpf_map_lookup_elem(&peer_port, &p);
+	if (!res) {
+		// new peer
+		alloced_ident = alloc_port();
+		if (bpf_map_update_elem(&peer_port, &p, &alloced_ident, 0) != 0) {
+			bpf_printk("failed to register.");
+		}
+	} else {
+		// already registered.
+		alloced_ident = *res;
+	}
+	return alloced_ident;
+}
 
 SEC("xdp")
 int nat_prog(struct xdp_md *ctx) {
@@ -222,27 +278,7 @@ int nat_prog(struct xdp_md *ctx) {
 		if (ingress_ifindex != *in_ifindex) {
 			return XDP_PASS;
 		}
-		if (arp->ar_hrd != 0x0100 || arp->ar_pro != 0x08) {
-			return XDP_PASS;
-		}
-		if (arp->ar_op != 0x100) {
-			return XDP_PASS;
-		}
-		// build reply
-		arp->ar_op = 0x0200;
-		arp->ar_hrd = 0x0100;
-		arp->ar_pro = 0x08;
-		arp->ar_hln = ETH_ALEN;
-		arp->ar_pln = 4;
-		__builtin_memcpy(arp->ar_tha, arp->ar_sha, ETH_ALEN);
-		__builtin_memcpy(arp->ar_sha, in_mac, ETH_ALEN);
-		__builtin_memcpy(global_addr, arp->ar_tip, 4);
-		__builtin_memcpy(arp->ar_tip, arp->ar_sip, 4);
-		__builtin_memcpy(arp->ar_sip, global_addr, 4);
-
-		__builtin_memcpy(eth->h_dest, arp->ar_tha, ETH_ALEN);
-		__builtin_memcpy(eth->h_source, in_mac, ETH_ALEN);
-		return XDP_TX;
+		return proxy_arp(arp, eth,in_mac, global_addr);
 	}
 	if (eth->h_proto != 0x08U) {
 		// not ipv4
@@ -258,17 +294,7 @@ int nat_prog(struct xdp_md *ctx) {
 		// in
 		// lookup route table
 		struct bpf_fib_lookup fib_params;
-		__builtin_memset(&fib_params, 0, sizeof(fib_params));
-		fib_params.family = AF_INET;
-		fib_params.ipv4_src = ip->saddr;
-		fib_params.ipv4_dst = ip->daddr;
-		fib_params.ifindex = ingress_ifindex;
-		int rc = bpf_fib_lookup(ctx, &fib_params, sizeof(fib_params), 0);
-		if ((rc != BPF_FIB_LKUP_RET_SUCCESS) && (rc != BPF_FIB_LKUP_RET_NO_NEIGH)) {
-			bpf_printk("fib lookup failed.");
-			return XDP_DROP;
-		} else if (rc == BPF_FIB_LKUP_RET_NO_NEIGH) {
-			bpf_printk("fib lookup result is no neigh.");
+		if (lookup_route_table(ctx, &fib_params, ip, ingress_ifindex) != 0) {
 			return XDP_PASS;
 		}
 
@@ -285,18 +311,7 @@ int nat_prog(struct xdp_md *ctx) {
 				struct peer p;
 				p.addr = ip->saddr;
 				p.port = ident;
-				__u16 alloced_ident;
-				__u16 *res = bpf_map_lookup_elem(&peer_port, &p);
-				if (!res) {
-					// new peer
-					alloced_ident = alloc_port();
-					if (bpf_map_update_elem(&peer_port, &p, &alloced_ident, 0) != 0) {
-						bpf_printk("failed to register.");
-					}
-				} else {
-					// already registered.
-					alloced_ident = *res;
-				}
+				__u16 alloced_ident = lookup_entry(p);
 				// change ident field
 				__u16 old_ident = icmp->un.echo.id;
 				icmp->un.echo.id = htons(alloced_ident);
