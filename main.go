@@ -5,7 +5,7 @@ import (
 	"fmt"
 )
 
-//go:generate go run github.com/cilium/ebpf/cmd/bpf2go -cc clang NaptProg ./bpf/napt.c -- -I./bpf/headers
+//go:generate go run github.com/cilium/ebpf/cmd/bpf2go -cc clang NaptProg ./bpf/napt.c -- -I./bpf/header
 
 func main() {
 	var in, out, global, local string
