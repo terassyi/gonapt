@@ -344,23 +344,11 @@ int nat_prog(struct xdp_md *ctx) {
 					bpf_printk("failed to update entries.");
 					return XDP_PASS;
 				}
-
-				__builtin_memcpy(eth->h_dest, fib_params.dmac, ETH_ALEN);
-				__builtin_memcpy(eth->h_source, fib_params.smac, ETH_ALEN);
-
-				// bpf_printk("dmac %x:%x", eth->h_dest[0], eth->h_dest[5]);
-				// bpf_printk("smac %x:%x", eth->h_source[0], eth->h_source[5]);
-				// bpf_printk("ip src %d", ip->saddr);
-				// bpf_printk("sent from global interface(%d).", *out_ifindex);
-				return bpf_redirect_map(&if_redirect, *out_ifindex, 0);
-				// return xdpcap_exit(ctx, &xdpcap_hook, action);
-				// return bpf_redirect_map(&if_redirect, *out_ifindex, 0);
-				// bpf_printk("action %d", action);
-				// return action;
 			}
-			bpf_printk("only handle icmp echo");
-			return XDP_PASS;
 
+			__builtin_memcpy(eth->h_dest, fib_params.dmac, ETH_ALEN);
+			__builtin_memcpy(eth->h_source, fib_params.smac, ETH_ALEN);
+			return bpf_redirect_map(&if_redirect, *out_ifindex, 0);
 		} else if (ip->protocol == 0x06) {
 			// tcp
 			struct tcphdr *tcp = data;
