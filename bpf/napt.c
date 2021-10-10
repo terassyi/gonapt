@@ -282,7 +282,6 @@ int nat_prog(struct xdp_md *ctx) {
 					return XDP_PASS;
 				}
 			}
-			bpf_printk("redirect!");
 			return redirect(eth, fib_params.smac, fib_params.dmac, *out_ifindex);
 
 		} else if (ip->protocol == 0x06) {
@@ -308,6 +307,18 @@ int nat_prog(struct xdp_md *ctx) {
 			p.addr = ip->saddr;
 			p.port = udp->uh_sport;
 			__u16 alloced_port = lookup_entry_key(p);
+			udp->source = alloced_port;
+			// update udp checksum
+			udp->check = ipv4_csum_update_u16(udp->check, udp->source, htons(alloced_port));
+			udp->check = ipv4_csum_update_u32(udp->check, ip->saddr, htons(*global_addr));
+			// ip checksum update
+			ip->saddr = *global_addr;
+			ip->check = 0;
+			ip->check = checksum((__u16 *)ip, sizeof(*ip));
+			if (update_entry(&alloced_port, p, ip->protocol, eth->h_source) != 0) {
+				bpf_printk("failed to update entries.");
+				return XDP_PASS;
+			}
 			bpf_printk("udp");
 			return redirect(eth, fib_params.smac, fib_params.dmac, *out_ifindex);
 		} else {

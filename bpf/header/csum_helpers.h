@@ -120,6 +120,15 @@ static inline __u16 ipv4_csum_update_u16(__u16 csum, __u16 old_val, __u16 new_va
 	return ~htons(sum);
 }
 
+static inline __u16 ipv4_csum_update_u32(__u16 csum, __u32 old_val, __u32 new_val) {
+	__u16 old_val_head = old_val >> 16;
+	__u16 new_val_head = new_val >> 16;
+	__u16 old_val_tail = old_val;
+	__u16 new_val_tail = new_val;
+	csum = ipv4_csum_update_u16(csum, old_val_head, new_val_head);
+	return ipv4_csum_update_u16(csum, old_val_tail, new_val_tail);
+}
+
 static inline void ipv4_l4_csum(void *data_start, int data_size, __u64 *csum, struct iphdr *iph) {
 	__u32 tmp = 0;
 	*csum = bpf_csum_diff(0, 0, &iph->saddr, sizeof(__u32), *csum);
