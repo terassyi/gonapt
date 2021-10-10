@@ -6,6 +6,70 @@
 
 #define DEBUG 1
 
+static inline __u16 checksum(__u16 *buf, __u32 bufsize) {
+	__u32 sum = 0;
+	while (bufsize > 1) {
+		sum += *buf;
+		buf++;
+		bufsize -= 2;
+	}
+	if (bufsize == 1) {
+		sum += *(__u8 *)buf;
+	}
+	sum = (sum & 0xffff) + (sum >> 16);
+	sum = (sum & 0xffff) + (sum >> 16);
+	return ~sum;
+}
+
+static inline __u16 checksum2(__u8 *data1, int len1, __u8 *data2, int len2) {
+	__u32 sum = 0;
+	__u16 *ptr;
+	int c;
+
+	ptr = (__u16 *)data1;
+
+	for (c = len1; c > 1; c -= 2) {
+		sum += (*ptr);
+		if (sum & 0x80000000) {
+			sum = (sum & 0xffff) + (sum >> 16);
+		}
+		ptr++;
+	}
+
+	if (c == 1) {
+		__u16 val;
+		val = ((*ptr) << 8) + (*data2);
+		sum += val;
+		if (sum & 0x80000000) {
+			sum = (sum & 0xffff) + (sum >> 16);
+		}
+		ptr = (__u16 *)(data2 + 1);
+		len2--;
+	} else {
+		ptr = (__u16 *)data2;
+	}
+
+	for (c = len2; c > 1; c -= 2) {
+		sum += (*ptr);
+		if (sum & 0x80000000) {
+			sum = (sum & 0xffff) + (sum >> 16);
+		}
+		ptr++;
+	}
+
+	if (c == 1) {
+		__u16 val = 0;
+		__builtin_memcpy(&val, ptr, sizeof(__u8));
+		sum += val;
+	}
+
+	while (sum >> 16) {
+		sum = (sum & 0xffff) + (sum >> 16);
+	}
+
+	return ~sum;
+}
+
 static inline __u16 csum_fold_helper(__u64 csum) {
 	int i;
 #pragma unroll
