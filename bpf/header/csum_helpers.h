@@ -1,0 +1,69 @@
+
+#include <netinet/in.h>
+#include <netinet/ip.h>
+#include <netinet/ip_icmp.h>
+#include "bpf_helpers.h"
+
+#define DEBUG 1
+
+static inline __u16 csum_fold_helper(__u64 csum) {
+	int i;
+#pragma unroll
+	for (i = 0; i < 4; i++) {
+		if (csum >> 16) {
+			csum = (csum & 0xffff) + (csum >> 16);
+		}
+	}
+	return ~csum;
+}
+
+static inline void ipv4_csum(void *data_start, int data_size, __u64 *csum) {
+	*csum = bpf_csum_diff(0, 0, data_start, data_size, *csum);
+	*csum = csum_fold_helper(*csum);
+}
+
+static inline void ipv4_csum_inline(void *iph, __u64 *csum) {
+	__u16 *next_iph_u16 = (__u16 *)iph;
+	for (int i = 0; i < sizeof(struct iphdr) >> 1; i++) {
+		*csum += *next_iph_u16++;
+	}
+	*csum = csum_fold_helper(*csum);
+}
+
+static inline void icmp_ident_csum_update(struct icmphdr *icmph, __u16 new_ident) {
+	__u64 csum = (__u64)icmph->checksum;
+	__u32 tmp = 0;
+	bpf_printk("csum %x", csum);
+	//tmp = __builtin_bswap32((__u32)icmph->un.echo.id);
+	tmp = (__u32)icmph->un.echo.id;
+	csum = bpf_csum_diff(&tmp, sizeof(__u32), 0, 0, csum);
+	bpf_printk("csum %x", csum);
+	// tmp = __builtin_bswap32((__u32)new_ident);
+	tmp = (__u32)new_ident;
+	csum = bpf_csum_diff(0, 0, &tmp, sizeof(__u32), csum);
+	bpf_printk("csum %x", csum);
+	csum = csum_fold_helper(csum);
+	icmph->checksum = csum;
+}
+
+static inline __u16 ipv4_csum_update_u16(__u16 csum, __u16 old_val, __u16 new_val) {
+	__u32 a = ~ntohs(csum) & 0x0000ffff;
+	__u32 b = ntohs(new_val) & 0x0000ffff;
+	__u32 c = ~ntohs(old_val) & 0x0000ffff;
+	__u32 sum = a + b + c;
+	sum = (sum & 0xffff) + (sum >> 16);
+	sum = (sum & 0xffff) + (sum >> 16);
+	return ~htons(sum);
+}
+
+static inline void ipv4_l4_csum(void *data_start, int data_size, __u64 *csum, struct iphdr *iph) {
+	__u32 tmp = 0;
+	*csum = bpf_csum_diff(0, 0, &iph->saddr, sizeof(__u32), *csum);
+	*csum = bpf_csum_diff(0, 0, &iph->daddr, sizeof(__u32), *csum);
+	tmp = __builtin_bswap32((__u32)iph->protocol);
+	*csum = bpf_csum_diff(0, 0, &tmp, sizeof(__u32), *csum);
+	tmp = __builtin_bswap32((__u32)data_size);
+	*csum = bpf_csum_diff(0, 0, &tmp, sizeof(__u32), *csum);
+	*csum = bpf_csum_diff(0, 0, data_start, data_size, *csum);
+	*csum = csum_fold_helper(*csum);
+}

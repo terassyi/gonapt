@@ -6,6 +6,7 @@
 #include <netinet/udp.h>
 #include <sys/socket.h>
 #include "bpf_helpers.h"
+#include "csum_helpers.h"
 
 #include "hook.h"
 
@@ -168,11 +169,6 @@ static inline __u16 checksum2(__u8 *data1, int len1, __u8 *data2, int len2) {
 	return ~sum;
 }
 
-static inline __u16 update_csum_u16(__u16 old_sum, __u16 old_data, __u16 new_data) {
-	__u32 new_sum = old_sum - ~old_data - new_data;
-	bpf_printk("new_sum %x", new_sum);
-	return new_sum;
-}
 
 static inline int proxy_arp(struct arphdr *arp, struct ethhdr *eth, __u8 *mac_addr, __u32 *global_addr) {
 	if (arp->ar_hrd != 0x0100 || arp->ar_pro != 0x08) {
@@ -316,16 +312,7 @@ int nat_prog(struct xdp_md *ctx) {
 				__u16 old_ident = icmp->un.echo.id;
 				icmp->un.echo.id = htons(alloced_ident);
 				// icmp->checksum = 0;
-				__u32 new = ~(__u32)ntohs(icmp->checksum) + ~(__u32)ntohs(old_ident) + (__u32)alloced_ident;
-				new = ~new;
-				if (new > 0xffff0000) {
-					new = (new & 0xffff) - 2;
-					bpf_printk("->");
-				} else {
-					new--;
-				}
-				icmp->checksum = htons((__u16)new);
-				bpf_printk("icmp checksum new = %x", new);
+				icmp->checksum = ipv4_csum_update_u16(icmp->checksum, old_ident, htons(alloced_ident));
 				// icmp->checksum = ()
 				// icmp->checksum = update_csum_u16(icmp->checksum, old_ident, htons(alloced_ident));
 				// change ip field
@@ -400,6 +387,7 @@ int nat_prog(struct xdp_md *ctx) {
 
 	} else {
 		// out
+		bpf_printk("egress proto=%d", ip->protocol);
 		if (ip->protocol == 0x01) {
 			// icmp
 			struct icmphdr *icmp = data;
@@ -417,23 +405,16 @@ int nat_prog(struct xdp_md *ctx) {
 				struct entry *ent = (void *)res;
 				// change ident field
 				__u16 old_ident = icmp->un.echo.id;
-				icmp->un.echo.id = htons(ent->port);
-				// icmp->checksum = 0;
-				__u32 new = ~(__u32)ntohs(icmp->checksum) + ~(__u32)ntohs(old_ident) + (__u32)ent->port;
-				new = ~new;
-				if (new > 0xffff0000) {
-					new = (new & 0xffff) - 2;
-				} else {
-					new--;
-				}
-				icmp->checksum = htons((__u16)new);
-				bpf_printk("icmp checksum new = %x", new);
-				// icmp->checksum = ()
-				// icmp->checksum = update_csum_u16(icmp->checksum, old_ident, htons(alloced_ident));
-				// change ip field
+				icmp->un.echo.id = ent->port;
+				__u64 icmp_sum = 0;
+				// ipv4_csum((void *)icmp, icmp_size / 8, &icmp_sum);
+				icmp->checksum = ipv4_csum_update_u16(icmp->checksum, old_ident, ent->port);
 				ip->daddr = ent->addr;
 				ip->check = 0;
-				ip->check = checksum((__u16 *)ip, sizeof(*ip));
+				// ip->check = checksum((__u16 *)ip, sizeof(*ip));
+				__u64 sum = 0;
+				ipv4_csum_inline(ip, &sum);
+				ip->check = (__u16)sum;
 
 				__builtin_memcpy(eth->h_source, out_mac, ETH_ALEN);
 				__builtin_memcpy(eth->h_dest, ent->mac_addr, ETH_ALEN);
@@ -447,8 +428,10 @@ int nat_prog(struct xdp_md *ctx) {
 
 		} else if (ip->protocol == 0x06) {
 			// tcp
+			bpf_printk("tcp");
 		} else if (ip->protocol == 0x11) {
 			// udp
+			bpf_printk("udp");
 		} else {
 			return XDP_PASS;
 		}
