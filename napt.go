@@ -15,6 +15,10 @@ import (
 const (
 	PORT_MIN uint32 = 49152
 	PORT_MAX uint32 = 65535
+
+	DEFAULT_TIMEOUT time.Duration = time.Second * 60
+	DEFAULT_TIMEOUT_HALF time.Duration = time.Second * 30
+	DEFAULT_TIMEOUT_SHORT time.Duration = time.Second * 10
 )
 
 type Napt struct {
@@ -25,6 +29,13 @@ type Napt struct {
 	localNet net.IPNet
 	spec *ebpf.CollectionSpec
 	collect *NaptCollect
+	gcMap map[uint16]*gcEntry
+	timeout time.Duration
+}
+
+type gcEntry struct {
+	mark int64
+	timestamp uint64
 }
 
 type NaptCollect struct {
@@ -57,25 +68,6 @@ func newNapt(in, out, global, local string) (*Napt, error) {
 	if err := spec.LoadAndAssign(collect, nil); err != nil {
 		return nil, err
 	}
-	// pinPath, err := ioutil.TempDir("/sys/fs/bpf", "napt")
-	// if err != nil {
-	// 	return nil, err
-	// }
-	// fmt.Println("pin path - ", pinPath)
-	// xdpcapSpec := &ebpf.MapSpec{
-	// 	Name: "xdpcap_hook",
-	// 	Type: ebpf.ProgramArray,
-	// 	KeySize: 4,
-	// 	ValueSize: 4,
-	// 	MaxEntries: 5,
-	// 	Pinning: ebpf.PinByName,
-	// }
-	// xdpcapHookMap, err := ebpf.NewMapWithOptions(xdpcapSpec, ebpf.MapOptions{ PinPath: pinPath})
-	// if err != nil {
-	// 	fmt.Println("error at creating xdpcap hook map.")
-	// 	return nil, err
-	// }
-	// collect.XdpcpHook = xdpcapHookMap
 	return &Napt {
 		in: inL,
 		out: outL,
@@ -84,6 +76,8 @@ func newNapt(in, out, global, local string) (*Napt, error) {
 		localNet: *localNet,
 		spec: spec,
 		collect: collect,
+		gcMap: make(map[uint16]*gcEntry),
+		timeout: DEFAULT_TIMEOUT_HALF,
 	}, nil
 }
 
@@ -100,12 +94,17 @@ func (n *Napt) Run() error {
 	ctrlC := make(chan os.Signal, 1)
 	signal.Notify(ctrlC, syscall.SIGHUP, syscall.SIGINT, syscall.SIGTERM, syscall.SIGQUIT)
 	ticker := time.NewTicker(time.Second * 10)
+	gcTicker := time.NewTicker(time.Second * 1)
 	fmt.Println("Go NAPT running...")
 	fmt.Println("Press CTRL+C to exit.")
 	for {
 		select {
 		case <-ticker.C:
 			n.Check()
+		case <-gcTicker.C:
+			if err := n.GarbageCollection(); err != nil {
+				fmt.Println(err)
+			}
 		case <-ctrlC:
 			fmt.Println("detaching xdp program...")
 			return n.Detach()
@@ -176,7 +175,7 @@ func (n *Napt) Prepare() error {
 func (n *Napt) Check() error {
 	var (
 		key uint16
-		value [21]byte
+		value [22]byte
 	)
 
 	iter := n.collect.Entries.Iterate()
@@ -190,6 +189,55 @@ func (n *Napt) Check() error {
 	}
 	fmt.Println("finished iterating")
 	return nil
+}
+
+func (n *Napt) GarbageCollection() error {
+	var (
+		key uint16
+		value [22]byte
+	)
+
+	iter := n.collect.Entries.Iterate()
+	for iter.Next(&key, &value) {
+		entry, err := entryFromBytes(value)
+		if err != nil {
+			fmt.Println(err)
+			return err
+		}
+		entry.global = key
+		g, ok := n.gcMap[key]
+		if !ok {
+			n.gcMap[key] = &gcEntry {
+				mark: 0,
+				timestamp: entry.timestamp,
+			}
+			continue
+		}
+
+		if entry.timestamp == g.timestamp {
+			g.mark++
+		} else {
+			g.mark = 0
+		}
+		if g.mark > int64(n.timeout.Seconds()) {
+			delete(n.gcMap, key)
+			if err := n.deleteEntry(key, peer{
+				addr: entry.addr,
+				port: entry.port,
+			}); err != nil {
+				return err
+			}
+		}
+		g.timestamp = entry.timestamp
+	}
+	return nil
+}
+
+func (n *Napt) deleteEntry(key uint16, p peer) error {
+	if err := n.collect.Entries.Delete(key); err != nil {
+		return err
+	}
+	return n.collect.PeerPortMap.Delete(p.Bytes())
 }
 
 func attach(prog *ebpf.Program, dev netlink.Link) error {

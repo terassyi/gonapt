@@ -49,7 +49,7 @@ BPF_MAP_ADD(if_mac);
 BPF_MAP_DEF(entries) = {
 	.map_type = BPF_MAP_TYPE_HASH,
 	.key_size = sizeof(__u16),
-	.value_size = sizeof(__u8) * 21,
+	.value_size = sizeof(__u8) * 22,
 	.max_entries = 1024,
 };
 BPF_MAP_ADD(entries);
@@ -172,6 +172,7 @@ static inline int update_entry(__u16 *key, struct peer p, __u8 protocol, __u8 *m
 	ent.protocol = protocol;
 	__builtin_memcpy(&ent.mac_addr, mac_addr, ETH_ALEN);
 	ent.timespamp = bpf_ktime_get_ns();
+	ent.gc = 0;
 	if (bpf_map_update_elem(&entries, key, &ent, 0) != 0) {
 		bpf_printk("failed to update entries.");
 		return -1;
@@ -206,7 +207,6 @@ int nat_prog(struct xdp_md *ctx) {
 		bpf_printk("failed to get from if_redirect");
 		return XDP_PASS;
 	}
-	bpf_printk("in = %d out = %d", *in, *out);
 
 	__u8 *in_mac = bpf_map_lookup_elem(&if_mac, in_ifindex);
 	__u8 *out_mac = bpf_map_lookup_elem(&if_mac, out_ifindex);
@@ -282,6 +282,7 @@ int nat_prog(struct xdp_md *ctx) {
 					return XDP_PASS;
 				}
 			}
+			bpf_printk("redirect!");
 			return redirect(eth, fib_params.smac, fib_params.dmac, *out_ifindex);
 
 		} else if (ip->protocol == 0x06) {
