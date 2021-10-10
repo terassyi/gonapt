@@ -6,7 +6,9 @@
 #include <netinet/udp.h>
 #include <sys/socket.h>
 #include "bpf_helpers.h"
+#include "csum_helpers.h"
 
+#include "header/bpf_helpers.h"
 #include "hook.h"
 
 #define PORT_MIN 49152
@@ -100,80 +102,91 @@ struct entry {
 	__u8 protocol;
 	__u8 mac_addr[6];
 	__u64 timespamp;
+	__u8 gc;
 };
 
 __u16 alloc_port();
 
-static inline __u16 checksum(__u16 *buf, __u32 bufsize) {
-	__u32 sum = 0;
-	while (bufsize > 1) {
-		sum += *buf;
-		buf++;
-		bufsize -= 2;
+static inline int proxy_arp(struct arphdr *arp, struct ethhdr *eth, __u8 *mac_addr, __u32 *global_addr) {
+	if (arp->ar_hrd != 0x0100 || arp->ar_pro != 0x08) {
+		return XDP_PASS;
 	}
-	if (bufsize == 1) {
-		sum += *(__u8 *)buf;
+	if (arp->ar_op != 0x100) {
+		return XDP_PASS;
 	}
-	sum = (sum & 0xffff) + (sum >> 16);
-	sum = (sum & 0xffff) + (sum >> 16);
-	return ~sum;
+	// build reply
+	arp->ar_op = 0x0200;
+	arp->ar_hrd = 0x0100;
+	arp->ar_pro = 0x08;
+	arp->ar_hln = ETH_ALEN;
+	arp->ar_pln = 4;
+	__builtin_memcpy(arp->ar_tha, arp->ar_sha, ETH_ALEN);
+	__builtin_memcpy(arp->ar_sha, mac_addr, ETH_ALEN);
+	__builtin_memcpy(global_addr, arp->ar_tip, 4);
+	__builtin_memcpy(arp->ar_tip, arp->ar_sip, 4);
+	__builtin_memcpy(arp->ar_sip, global_addr, 4);
+
+	__builtin_memcpy(eth->h_dest, arp->ar_tha, ETH_ALEN);
+	__builtin_memcpy(eth->h_source, mac_addr, ETH_ALEN);
+	return XDP_TX;
 }
 
-static inline __u16 checksum2(__u8 *data1, int len1, __u8 *data2, int len2) {
-	__u32 sum = 0;
-	__u16 *ptr;
-	int c;
-
-	ptr = (__u16 *)data1;
-
-	for (c = len1; c > 1; c -= 2) {
-		sum += (*ptr);
-		if (sum & 0x80000000) {
-			sum = (sum & 0xffff) + (sum >> 16);
-		}
-		ptr++;
+static inline int lookup_route_table(struct xdp_md *ctx, struct bpf_fib_lookup *fib_params, struct iphdr *ip, __u32 ifindex) {
+	__builtin_memset(fib_params, 0, sizeof(*fib_params));
+	fib_params->family = AF_INET;
+	fib_params->ipv4_src = ip->saddr;
+	fib_params->ipv4_dst = ip->daddr;
+	fib_params->ifindex = ifindex;
+	int rc = bpf_fib_lookup(ctx, fib_params, sizeof(*fib_params), 0);
+	if ((rc != BPF_FIB_LKUP_RET_SUCCESS) && (rc != BPF_FIB_LKUP_RET_NO_NEIGH)) {
+		bpf_printk("fib lookup failed.");
+		return -1;
+	} else if (rc == BPF_FIB_LKUP_RET_NO_NEIGH) {
+		bpf_printk("fib lookup result is no neigh.");
+		return -1;
 	}
+	return 0;
+}
 
-	if (c == 1) {
-		__u16 val;
-		val = ((*ptr) << 8) + (*data2);
-		sum += val;
-		if (sum & 0x80000000) {
-			sum = (sum & 0xffff) + (sum >> 16);
+static inline __u16 lookup_entry_key(struct peer p) {
+	__u16 alloced_ident = 0;
+	__u16 *res = bpf_map_lookup_elem(&peer_port, &p);
+	if (!res) {
+		// new peer
+		alloced_ident = alloc_port();
+		if (bpf_map_update_elem(&peer_port, &p, &alloced_ident, 0) != 0) {
+			bpf_printk("failed to register.");
 		}
-		ptr = (__u16 *)(data2 + 1);
-		len2--;
 	} else {
-		ptr = (__u16 *)data2;
+		// already registered.
+		alloced_ident = *res;
 	}
-
-	for (c = len2; c > 1; c -= 2) {
-		sum += (*ptr);
-		if (sum & 0x80000000) {
-			sum = (sum & 0xffff) + (sum >> 16);
-		}
-		ptr++;
-	}
-
-	if (c == 1) {
-		__u16 val = 0;
-		__builtin_memcpy(&val, ptr, sizeof(__u8));
-		sum += val;
-	}
-
-	while (sum >> 16) {
-		sum = (sum & 0xffff) + (sum >> 16);
-	}
-
-	return ~sum;
+	return alloced_ident;
 }
 
-static inline __u16 update_csum_u16(__u16 old_sum, __u16 old_data, __u16 new_data) {
-	__u32 new_sum = old_sum - ~old_data - new_data;
-	bpf_printk("new_sum %x", new_sum);
-	return new_sum;
+static inline int update_entry(__u16 *key, struct peer p, __u8 protocol, __u8 *mac_addr) {
+	struct entry ent;
+	__builtin_memset(&ent, 0, sizeof(ent));
+	ent.addr = p.addr;
+	ent.port = p.port;
+	ent.protocol = protocol;
+	__builtin_memcpy(&ent.mac_addr, mac_addr, ETH_ALEN);
+	ent.timespamp = bpf_ktime_get_ns();
+	if (bpf_map_update_elem(&entries, key, &ent, 0) != 0) {
+		bpf_printk("failed to update entries.");
+		return -1;
+	}
+	return 0;
 }
 
+
+
+static inline int redirect(struct ethhdr *eth, __u8 *s_mac, __u8 *d_mac, __u32 ifindex) {
+	__builtin_memcpy(eth->h_dest, d_mac, ETH_ALEN);
+	__builtin_memcpy(eth->h_source, s_mac, ETH_ALEN);
+	return bpf_redirect_map(&if_redirect, ifindex, 0);
+
+}
 
 SEC("xdp")
 int nat_prog(struct xdp_md *ctx) {
@@ -222,27 +235,7 @@ int nat_prog(struct xdp_md *ctx) {
 		if (ingress_ifindex != *in_ifindex) {
 			return XDP_PASS;
 		}
-		if (arp->ar_hrd != 0x0100 || arp->ar_pro != 0x08) {
-			return XDP_PASS;
-		}
-		if (arp->ar_op != 0x100) {
-			return XDP_PASS;
-		}
-		// build reply
-		arp->ar_op = 0x0200;
-		arp->ar_hrd = 0x0100;
-		arp->ar_pro = 0x08;
-		arp->ar_hln = ETH_ALEN;
-		arp->ar_pln = 4;
-		__builtin_memcpy(arp->ar_tha, arp->ar_sha, ETH_ALEN);
-		__builtin_memcpy(arp->ar_sha, in_mac, ETH_ALEN);
-		__builtin_memcpy(global_addr, arp->ar_tip, 4);
-		__builtin_memcpy(arp->ar_tip, arp->ar_sip, 4);
-		__builtin_memcpy(arp->ar_sip, global_addr, 4);
-
-		__builtin_memcpy(eth->h_dest, arp->ar_tha, ETH_ALEN);
-		__builtin_memcpy(eth->h_source, in_mac, ETH_ALEN);
-		return XDP_TX;
+		return proxy_arp(arp, eth,in_mac, global_addr);
 	}
 	if (eth->h_proto != 0x08U) {
 		// not ipv4
@@ -258,17 +251,7 @@ int nat_prog(struct xdp_md *ctx) {
 		// in
 		// lookup route table
 		struct bpf_fib_lookup fib_params;
-		__builtin_memset(&fib_params, 0, sizeof(fib_params));
-		fib_params.family = AF_INET;
-		fib_params.ipv4_src = ip->saddr;
-		fib_params.ipv4_dst = ip->daddr;
-		fib_params.ifindex = ingress_ifindex;
-		int rc = bpf_fib_lookup(ctx, &fib_params, sizeof(fib_params), 0);
-		if ((rc != BPF_FIB_LKUP_RET_SUCCESS) && (rc != BPF_FIB_LKUP_RET_NO_NEIGH)) {
-			bpf_printk("fib lookup failed.");
-			return XDP_DROP;
-		} else if (rc == BPF_FIB_LKUP_RET_NO_NEIGH) {
-			bpf_printk("fib lookup result is no neigh.");
+		if (lookup_route_table(ctx, &fib_params, ip, ingress_ifindex) != 0) {
 			return XDP_PASS;
 		}
 
@@ -285,66 +268,21 @@ int nat_prog(struct xdp_md *ctx) {
 				struct peer p;
 				p.addr = ip->saddr;
 				p.port = ident;
-				__u16 alloced_ident;
-				__u16 *res = bpf_map_lookup_elem(&peer_port, &p);
-				if (!res) {
-					// new peer
-					alloced_ident = alloc_port();
-					if (bpf_map_update_elem(&peer_port, &p, &alloced_ident, 0) != 0) {
-						bpf_printk("failed to register.");
-					}
-				} else {
-					// already registered.
-					alloced_ident = *res;
-				}
+				__u16 alloced_ident = lookup_entry_key(p);
 				// change ident field
 				__u16 old_ident = icmp->un.echo.id;
 				icmp->un.echo.id = htons(alloced_ident);
-				// icmp->checksum = 0;
-				__u32 new = ~(__u32)ntohs(icmp->checksum) + ~(__u32)ntohs(old_ident) + (__u32)alloced_ident;
-				new = ~new;
-				if (new > 0xffff0000) {
-					new = (new & 0xffff) - 2;
-					bpf_printk("->");
-				} else {
-					new--;
-				}
-				icmp->checksum = htons((__u16)new);
-				bpf_printk("icmp checksum new = %x", new);
-				// icmp->checksum = ()
-				// icmp->checksum = update_csum_u16(icmp->checksum, old_ident, htons(alloced_ident));
+				icmp->checksum = ipv4_csum_update_u16(icmp->checksum, old_ident, htons(alloced_ident));
 				// change ip field
 				ip->saddr = *global_addr;
 				ip->check = 0;
 				ip->check = checksum((__u16 *)ip, sizeof(*ip));
-
-				struct entry ent;
-				__builtin_memset(&ent, 0, sizeof(ent));
-				ent.addr = p.addr;
-				ent.port = p.port;
-				ent.protocol = ip->protocol;
-				__builtin_memcpy(&ent.mac_addr, eth->h_source, 6);
-				ent.timespamp = bpf_ktime_get_ns();
-				if (bpf_map_update_elem(&entries, &alloced_ident, &ent, 0) != 0) {
+				if (update_entry(&alloced_ident, p, ip->protocol, eth->h_source) != 0) {
 					bpf_printk("failed to update entries.");
 					return XDP_PASS;
 				}
-
-				__builtin_memcpy(eth->h_dest, fib_params.dmac, ETH_ALEN);
-				__builtin_memcpy(eth->h_source, fib_params.smac, ETH_ALEN);
-
-				// bpf_printk("dmac %x:%x", eth->h_dest[0], eth->h_dest[5]);
-				// bpf_printk("smac %x:%x", eth->h_source[0], eth->h_source[5]);
-				// bpf_printk("ip src %d", ip->saddr);
-				// bpf_printk("sent from global interface(%d).", *out_ifindex);
-				return bpf_redirect_map(&if_redirect, *out_ifindex, 0);
-				// return xdpcap_exit(ctx, &xdpcap_hook, action);
-				// return bpf_redirect_map(&if_redirect, *out_ifindex, 0);
-				// bpf_printk("action %d", action);
-				// return action;
 			}
-			bpf_printk("only handle icmp echo");
-			return XDP_PASS;
+			return redirect(eth, fib_params.smac, fib_params.dmac, *out_ifindex);
 
 		} else if (ip->protocol == 0x06) {
 			// tcp
@@ -352,24 +290,12 @@ int nat_prog(struct xdp_md *ctx) {
 			if (data + sizeof(*tcp) > data_end) {
 				return XDP_DROP;
 			}
-			// struct peer p;
-			// p.addr = ip->saddr;
-			// p.port = tcp->source;
-			// if (bpf_map_lookup_elem(&peer_port, &p) != 0) {
-			// 	// already registered.
-			// 	bpf_printk("peer already registered.");
-			// } else {
-			// 	// new peer
-			// 	__u16 port = alloc_port();
-			// 	if (bpf_map_update_elem(&peer_port, &p, &port, 0) != 0) {
-			// 		bpf_printk("failed to register.");
-			// 	}
-			// }
+			struct peer p;
+			p.addr = ip->saddr;
+			p.port = tcp->th_sport;
+			__u16 alloced_port = lookup_entry_key(p);
 			bpf_printk("tcp");
-			__builtin_memcpy(eth->h_dest, fib_params.dmac, ETH_ALEN);
-			__builtin_memcpy(eth->h_source, fib_params.smac, ETH_ALEN);
-			return bpf_redirect_map(&if_redirect, *out_ifindex, 0);
-			// return xdpcap_exit(ctx, &xdpcap_hook, action);
+			return redirect(eth, fib_params.smac, fib_params.dmac, *out_ifindex);
 
 		} else if (ip->protocol == 0x11) {
 			// udp
@@ -380,17 +306,9 @@ int nat_prog(struct xdp_md *ctx) {
 			struct peer p;
 			p.addr = ip->saddr;
 			p.port = udp->uh_sport;
-			if (bpf_map_lookup_elem(&peer_port, &p) != 0) {
-				// already registered.
-				bpf_printk("peer already registered.");
-			} else {
-				// new peer
-				__u16 port = alloc_port();
-				if (bpf_map_update_elem(&peer_port, &p, &port, 0) != 0) {
-					bpf_printk("failed to register.");
-				}
-			}
+			__u16 alloced_port = lookup_entry_key(p);
 			bpf_printk("udp");
+			return redirect(eth, fib_params.smac, fib_params.dmac, *out_ifindex);
 		} else {
 			return XDP_PASS;
 		}
@@ -414,38 +332,32 @@ int nat_prog(struct xdp_md *ctx) {
 				struct entry *ent = (void *)res;
 				// change ident field
 				__u16 old_ident = icmp->un.echo.id;
-				icmp->un.echo.id = htons(ent->port);
-				// icmp->checksum = 0;
-				__u32 new = ~(__u32)ntohs(icmp->checksum) + ~(__u32)ntohs(old_ident) + (__u32)ent->port;
-				new = ~new;
-				if (new > 0xffff0000) {
-					new = (new & 0xffff) - 2;
-				} else {
-					new--;
-				}
-				icmp->checksum = htons((__u16)new);
-				bpf_printk("icmp checksum new = %x", new);
-				// icmp->checksum = ()
-				// icmp->checksum = update_csum_u16(icmp->checksum, old_ident, htons(alloced_ident));
-				// change ip field
+				icmp->un.echo.id = ent->port;
+				icmp->checksum = ipv4_csum_update_u16(icmp->checksum, old_ident, ent->port);
 				ip->daddr = ent->addr;
 				ip->check = 0;
-				ip->check = checksum((__u16 *)ip, sizeof(*ip));
+				__u64 sum = 0;
+				ipv4_csum_inline(ip, &sum);
+				ip->check = (__u16)sum;
 
-				__builtin_memcpy(eth->h_source, out_mac, ETH_ALEN);
-				__builtin_memcpy(eth->h_dest, ent->mac_addr, ETH_ALEN);
-				bpf_printk("out dmac %x:%x", eth->h_dest[0], eth->h_dest[5]);
-				bpf_printk("out smac %x:%x", eth->h_source[0], eth->h_source[5]);
-				// bpf_printk("ip src %d", ip->saddr);
-				// bpf_printk("sent from global interface(%d).", *out_ifindex);
-				
-				return bpf_redirect_map(&if_redirect, *in_ifindex, 0);
+				return redirect(eth, out_mac, ent->mac_addr, *in_ifindex);
 			}
 
 		} else if (ip->protocol == 0x06) {
 			// tcp
+			struct tcphdr *tcp = data;
+			if (data + sizeof(*tcp) > data_end) {
+				return XDP_DROP;
+			}
+
+			bpf_printk("tcp");
 		} else if (ip->protocol == 0x11) {
 			// udp
+			struct udphdr *udp;
+			if (data + sizeof(*udp) > data_end) {
+				return XDP_DROP;
+			}
+			bpf_printk("udp");
 		} else {
 			return XDP_PASS;
 		}

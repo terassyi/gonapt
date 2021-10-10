@@ -193,7 +193,8 @@ func (n *Napt) Check() error {
 }
 
 func attach(prog *ebpf.Program, dev netlink.Link) error {
-	return netlink.LinkSetXdpFd(dev, prog.FD())
+	return netlink.LinkSetXdpFdWithFlags(dev, prog.FD(), 1 << 1)
+	// return netlink.LinkSetXdpFd(dev, prog.FD())
 }
 
 func detach(dev netlink.Link) error {
