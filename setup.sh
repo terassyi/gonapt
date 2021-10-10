@@ -69,12 +69,19 @@ if [ "$BUILD" = "$1" ]; then
 	sudo ip netns exec host1 ip route add default via 10.0.0.254
 	sudo ip netns exec host2 ip route add default via 10.0.0.254
 	sudo ip netns exec host3 ip route add default via 10.0.0.254
-	sudo ip route add 138.76.29.0/24 via 138.76.28.1
+	sudo ip route add 138.76.29.0/24 via 138.76.28.1 dev np-w
 	sudo ip netns exec router ip route add default via 138.76.29.254
 	sudo ip netns exec srv ip route add default via 138.76.29.254
 
 
 elif [ "$CLEAN" = "$1" ]; then
+	sudo ip link del np-w
+	sudo ip link del np-l
+	sudo ip link del br0
+	sudo ip link del br0-v0
+	sudo ip link del br0-v1
+	sudo ip link del br0-v2
+	sudo ip route del 138.76.29.0/24 via 138.76.28.1 dev np-w
 	sudo ip netns del srv
 	sudo ip netns del router
 	sudo ip netns del host1
