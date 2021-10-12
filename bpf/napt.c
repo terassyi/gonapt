@@ -282,7 +282,6 @@ int nat_prog(struct xdp_md *ctx) {
 					return XDP_PASS;
 				}
 			}
-			bpf_printk("redirect!");
 			return redirect(eth, fib_params.smac, fib_params.dmac, *out_ifindex);
 
 		} else if (ip->protocol == 0x06) {
@@ -308,7 +307,18 @@ int nat_prog(struct xdp_md *ctx) {
 			p.addr = ip->saddr;
 			p.port = udp->uh_sport;
 			__u16 alloced_port = lookup_entry_key(p);
-			bpf_printk("udp");
+			udp->uh_sport = htons(alloced_port);
+			// update udp checksum
+			udp->uh_sum = ipv4_csum_update_u16(udp->uh_sum, udp->uh_sport, htons(alloced_port));
+			udp->uh_sum = ipv4_csum_update_u32(udp->uh_sum, ip->saddr, htons(*global_addr));
+			// ip checksum update
+			ip->saddr = *global_addr;
+			ip->check = 0;
+			ip->check = checksum((__u16 *)ip, sizeof(*ip));
+			if (update_entry(&alloced_port, p, ip->protocol, eth->h_source) != 0) {
+				bpf_printk("failed to update entries.");
+				return XDP_PASS;
+			}
 			return redirect(eth, fib_params.smac, fib_params.dmac, *out_ifindex);
 		} else {
 			return XDP_PASS;
@@ -354,17 +364,33 @@ int nat_prog(struct xdp_md *ctx) {
 			bpf_printk("tcp");
 		} else if (ip->protocol == 0x11) {
 			// udp
-			struct udphdr *udp;
+			struct udphdr *udp = data;
 			if (data + sizeof(*udp) > data_end) {
 				return XDP_DROP;
 			}
-			bpf_printk("udp");
+			__u16 dest_port = ntohs(udp->uh_dport);
+			__u8 *res = bpf_map_lookup_elem(&entries, &dest_port);
+			if (!res) {
+				bpf_printk("peer information is not registered.");
+				return XDP_PASS;
+			}
+			struct entry *ent = (void *)res;
+			// update dest port
+			udp->uh_dport = ent->port;
+			// update ip dest
+			__u32 old_addr = ip->daddr;
+			ip->daddr = ent->addr;
+			// update udp check
+			udp->uh_sum = ipv4_csum_update_u16(udp->uh_sum, dest_port, udp->uh_dport);
+			udp->uh_sum = ipv4_csum_update_u32(udp->uh_sum, old_addr, ip->daddr);
+			// update ip checksum
+			ip->check = ipv4_csum_update_u32(ip->check, old_addr, ip->daddr);
+			return redirect(eth, out_mac, ent->mac_addr, *in_ifindex);
 		} else {
 			return XDP_PASS;
 		}
 
 	}
-	bpf_printk("pass to end.");
 	return XDP_PASS;
 }
 
