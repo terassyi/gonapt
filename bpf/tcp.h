@@ -3,6 +3,9 @@
 // only handle client tcp state.
 static inline __u8 tcp_state_update(__u8 current_state, __u8 flag, int snd) {
 	__u8 state = current_state;
+	if (flag & TH_RST) {
+		return TCP_CLOSE;
+	}
 	switch (current_state) {
 		case TCP_ESTABLISHED:
 			if ((flag & TH_FIN) && snd == 1) {
@@ -12,7 +15,7 @@ static inline __u8 tcp_state_update(__u8 current_state, __u8 flag, int snd) {
 			}
 			break;
 		case TCP_SYN_SENT:
-			if ((flag & (TH_SYN + TH_ACK)) && snd == 0) {
+			if (((flag & TH_SYN) && (flag & TH_ACK)) && snd == 0) {
 				state = TCP_ESTABLISHED;
 			} else if ((flag & TH_SYN) && snd == 0) {
 				state = TCP_SYN_RECV;
@@ -21,7 +24,7 @@ static inline __u8 tcp_state_update(__u8 current_state, __u8 flag, int snd) {
 		case TCP_SYN_RECV:
 			break;
 		case TCP_FIN_WAIT1:
-			if ((flag & (TH_FIN + TH_ACK)) && snd == 0) {
+			if (((flag & TH_FIN) && (flag & TH_ACK)) && snd == 0) {
 				// state = TCP_TIME_WAIT;
 				state = TCP_CLOSE;
 			} else if ((flag & TH_ACK) && snd == 0) {

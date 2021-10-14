@@ -9,6 +9,7 @@
 #include "csum_helpers.h"
 
 #include "header/bpf_helpers.h"
+#include "tcp.h"
 #include "hook.h"
 
 #define PORT_MIN 49152
@@ -100,9 +101,9 @@ struct entry {
 	__u32 addr;
 	__u16 port;
 	__u8 protocol;
-	__u8 mac_addr[6];
-	__u64 timespamp;
 	__u8 flag;
+	__u8 mac_addr[6];
+	__u64 timestamp;
 };
 
 __u16 alloc_port();
@@ -164,23 +165,30 @@ static inline __u16 lookup_entry_key(struct peer p) {
 	return alloced_ident;
 }
 
-static inline int update_entry(__u16 *key, struct peer p, __u8 protocol, __u8 *mac_addr) {
+static inline int lookup_entry(__u16 *key, struct entry *ent) {
+	__u8 *res = bpf_map_lookup_elem(&entries, key);
+	if (!res) {
+		return -1;
+	}
+	ent = (void *)res;
+	return 0;
+}
+
+static inline int update_entry(__u16 *key, struct peer p, __u8 protocol, __u8 *mac_addr, __u8 flag) {
 	struct entry ent;
 	__builtin_memset(&ent, 0, sizeof(ent));
 	ent.addr = p.addr;
 	ent.port = p.port;
 	ent.protocol = protocol;
 	__builtin_memcpy(&ent.mac_addr, mac_addr, ETH_ALEN);
-	ent.timespamp = bpf_ktime_get_ns();
-	ent.flag = 0;
+	ent.timestamp = bpf_ktime_get_ns();
+	ent.flag = flag;
 	if (bpf_map_update_elem(&entries, key, &ent, 0) != 0) {
 		bpf_printk("failed to update entries.");
 		return -1;
 	}
 	return 0;
 }
-
-
 
 static inline int redirect(struct ethhdr *eth, __u8 *s_mac, __u8 *d_mac, __u32 ifindex) {
 	__builtin_memcpy(eth->h_dest, d_mac, ETH_ALEN);
@@ -226,7 +234,6 @@ int nat_prog(struct xdp_md *ctx) {
 	}
 	if (eth->h_proto == 0x0608) {
 		// arp
-		bpf_printk("arp");
 		// proxy arp handle
 		struct arphdr *arp = data;
 		if (data + sizeof(*arp) > data_end) {
@@ -277,8 +284,7 @@ int nat_prog(struct xdp_md *ctx) {
 				ip->saddr = *global_addr;
 				ip->check = 0;
 				ip->check = checksum((__u16 *)ip, sizeof(*ip));
-				if (update_entry(&alloced_ident, p, ip->protocol, eth->h_source) != 0) {
-					bpf_printk("failed to update entries.");
+				if (update_entry(&alloced_ident, p, ip->protocol, eth->h_source, 0) != 0) {
 					return XDP_PASS;
 				}
 			}
@@ -302,11 +308,20 @@ int nat_prog(struct xdp_md *ctx) {
 			// update ip field
 			ip->check = ipv4_csum_update_u32(ip->check, ip->saddr, *global_addr);
 			ip->saddr = *global_addr;
-			if (update_entry(&alloced_port, p, ip->protocol, eth->h_source) != 0) {
-				bpf_printk("failed to update entries.");
-				return XDP_PASS;
+			// update tcp state
+			__u8 tcp_state = 0;
+			__u8 *res = bpf_map_lookup_elem(&entries, &alloced_port);
+			if (!res) {
+				tcp_state = (__u8)TCP_CLOSE;
 			}
-			bpf_printk("tcp");
+			struct entry *ent = (void *)res;
+			if (tcp_state == 0) {
+				tcp_state = ent->flag;
+			}
+			__u8 new_tcp_state = tcp_state_update(tcp_state, tcp->th_flags, 1);
+			if (update_entry(&alloced_port, p, ip->protocol, eth->h_source, new_tcp_state) != 0) {
+					return XDP_PASS;
+			}
 			return redirect(eth, fib_params.smac, fib_params.dmac, *out_ifindex);
 
 		} else if (ip->protocol == 0x11) {
@@ -328,8 +343,7 @@ int nat_prog(struct xdp_md *ctx) {
 			ip->saddr = *global_addr;
 			ip->check = 0;
 			ip->check = checksum((__u16 *)ip, sizeof(*ip));
-			if (update_entry(&alloced_port, p, ip->protocol, eth->h_source) != 0) {
-				bpf_printk("failed to update entries.");
+			if (update_entry(&alloced_port, p, ip->protocol, eth->h_source, 0) != 0) {
 				return XDP_PASS;
 			}
 			return redirect(eth, fib_params.smac, fib_params.dmac, *out_ifindex);
@@ -350,7 +364,6 @@ int nat_prog(struct xdp_md *ctx) {
 				__u16 ident = ntohs(icmp->un.echo.id);
 				__u8 *res = bpf_map_lookup_elem(&entries, &ident);
 				if (!res) {
-					bpf_printk("peer infomation is not registered.");
 					return XDP_PASS;
 				}
 				struct entry *ent = (void *)res;
@@ -376,10 +389,10 @@ int nat_prog(struct xdp_md *ctx) {
 			__u16 dest_port = ntohs(tcp->th_dport);
 			__u8 *res = bpf_map_lookup_elem(&entries, &dest_port);
 			if (!res) {
-				bpf_printk("peer information is not registered.");
 				return XDP_PASS;
 			}
 			struct entry *ent = (void *)res;
+			__u8 tcp_state = tcp_state_update(ent->flag, tcp->th_flags, 0);
 			// update tcp checksum
 			tcp->th_sum = ipv4_csum_update_u16(tcp->th_sum, tcp->th_dport, ent->port);
 			tcp->th_sum = ipv4_csum_update_u32(tcp->th_sum, ip->daddr, ent->addr);
@@ -389,7 +402,12 @@ int nat_prog(struct xdp_md *ctx) {
 			ip->check = ipv4_csum_update_u32(ip->check, ip->daddr, ent->addr);
 			// update ip dest
 			ip->daddr = ent->addr;
-			bpf_printk("tcp");
+			struct peer p;
+			p.addr = ent->addr;
+			p.port = ent->port;
+			if (update_entry(&dest_port, p, ent->protocol, ent->mac_addr, tcp_state) != 0) {
+				return XDP_PASS;
+			}
 			return redirect(eth, out_mac, ent->mac_addr, *in_ifindex);
 		} else if (ip->protocol == 0x11) {
 			// udp
@@ -400,7 +418,6 @@ int nat_prog(struct xdp_md *ctx) {
 			__u16 dest_port = ntohs(udp->uh_dport);
 			__u8 *res = bpf_map_lookup_elem(&entries, &dest_port);
 			if (!res) {
-				bpf_printk("peer information is not registered.");
 				return XDP_PASS;
 			}
 			struct entry *ent = (void *)res;

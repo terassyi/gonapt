@@ -17,6 +17,7 @@ const (
 	PORT_MAX uint32 = 65535
 
 	DEFAULT_TIMEOUT time.Duration = time.Second * 60
+	DEFAULT_TCP_TIMEOUT time.Duration = time.Second * 60 * 60
 	DEFAULT_TIMEOUT_HALF time.Duration = time.Second * 30
 	DEFAULT_TIMEOUT_SHORT time.Duration = time.Second * 10
 )
@@ -31,6 +32,7 @@ type Napt struct {
 	collect *NaptCollect
 	gcMap map[uint16]*gcEntry
 	timeout time.Duration
+	tcpTimeout time.Duration
 }
 
 type gcEntry struct {
@@ -78,6 +80,7 @@ func newNapt(in, out, global, local string) (*Napt, error) {
 		collect: collect,
 		gcMap: make(map[uint16]*gcEntry),
 		timeout: DEFAULT_TIMEOUT_HALF,
+		tcpTimeout: DEFAULT_TCP_TIMEOUT,
 	}, nil
 }
 
@@ -219,13 +222,37 @@ func (n *Napt) GarbageCollection() error {
 		} else {
 			g.mark = 0
 		}
-		if g.mark > int64(n.timeout.Seconds()) {
-			delete(n.gcMap, key)
-			if err := n.deleteEntry(key, peer{
-				addr: entry.addr,
-				port: entry.port,
-			}); err != nil {
-				return err
+		if entry.protocol != 0x06 {
+			if g.mark > int64(n.timeout.Seconds()) {
+				delete(n.gcMap, key)
+				if err := n.deleteEntry(key, peer{
+					addr: entry.addr,
+					port: entry.port,
+				}); err != nil {
+					return err
+				}
+			}
+		} else {
+			if entry.flag == TCP_CLOSE  || entry.flag == TCP_SYN_SENT {
+				if g.mark > int64(n.timeout.Seconds()) {
+					delete(n.gcMap, key)
+					if err := n.deleteEntry(key, peer{
+						addr: entry.addr,
+						port: entry.port,
+					}); err != nil {
+						return err
+					}
+				}
+			} else {
+				if g.mark > int64(n.tcpTimeout.Seconds()) {
+					delete(n.gcMap, key)
+					if err := n.deleteEntry(key, peer{
+						addr: entry.addr,
+						port: entry.port,
+					}); err != nil {
+						return err
+					}
+				}
 			}
 		}
 		g.timestamp = entry.timestamp
