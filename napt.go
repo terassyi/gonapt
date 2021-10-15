@@ -47,7 +47,6 @@ type NaptCollect struct {
 	IfMacMap *ebpf.Map `ebpf:"if_mac"`
 	IfAddrMap *ebpf.Map `ebpf:"if_addr"`
 	PeerPortMap *ebpf.Map `ebpf:"peer_port"`
-	PortPeerMap *ebpf.Map `ebpf:"port_peer"`
 	Entries *ebpf.Map `ebpf:"entries"`
 	XdpcpHook *ebpf.Map `ebpf:"xdpcap_hook"`
 }

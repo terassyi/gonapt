@@ -63,15 +63,6 @@ BPF_MAP_DEF(peer_port) = {
 };
 BPF_MAP_ADD(peer_port);
 
-BPF_MAP_DEF(port_peer) = {
-	.map_type = BPF_MAP_TYPE_HASH,
-	.key_size = sizeof(__u16),
-	.value_size = sizeof(__u8) * 6,
-	.max_entries = 1024,
-};
-BPF_MAP_ADD(port_peer);
-
-
 BPF_MAP_DEF(xdpcap_hook) = {
 	.map_type = BPF_MAP_TYPE_PROG_ARRAY,
 	.key_size = sizeof(int),
@@ -253,6 +244,10 @@ int nat_prog(struct xdp_md *ctx) {
 	if (data + sizeof(*ip) > data_end) {
 		return XDP_DROP;
 	}
+	ip->ttl--;
+	if (ip->ttl == 0) {
+		return XDP_PASS;
+	}
 	data += sizeof(*ip);
 	if (ingress_ifindex == *in_ifindex) {
 		// in
@@ -269,7 +264,7 @@ int nat_prog(struct xdp_md *ctx) {
 			if (data + sizeof(*icmp) > data_end) {
 				return XDP_DROP;
 			}
-			if (icmp->type == 0 || icmp->type == 8) {
+			if (icmp->type == 0 || icmp->type == 8 || (icmp->type > 12 && icmp->type < 19)) {
 				// echo request or reply
 				__u16 ident = icmp->un.echo.id;
 				struct peer p;
@@ -359,7 +354,7 @@ int nat_prog(struct xdp_md *ctx) {
 			if (data + sizeof(*icmp) > data_end) {
 				return XDP_DROP;
 			}
-			if (icmp->type == 0 || icmp->type == 8) {
+			if (icmp->type == 0 || icmp->type == 8 || (icmp->type > 12 && icmp->type < 19)) {
 				// echo request or reply
 				__u16 ident = ntohs(icmp->un.echo.id);
 				__u8 *res = bpf_map_lookup_elem(&entries, &ident);
@@ -378,6 +373,65 @@ int nat_prog(struct xdp_md *ctx) {
 				ip->check = (__u16)sum;
 
 				return redirect(eth, out_mac, ent->mac_addr, *in_ifindex);
+			} else if ((icmp->type > 2 && icmp->type < 6) || (icmp->type > 10 && icmp->type < 13)) {
+				data += 8;
+				struct iphdr *prev_ip = data;
+				if (data + sizeof(*prev_ip) > data_end) {
+					return XDP_PASS;
+				}
+				bpf_printk("icmp prev_ip proto %d", prev_ip->protocol);
+				// tcp or udp
+				data += sizeof(*prev_ip);
+				if (prev_ip->protocol == 0x06) {
+					struct tcphdr *prev_tcp = data;
+					if (data + sizeof(*prev_tcp) > data_end) {
+						return XDP_PASS;
+					}
+					__u16 prev_source_port = ntohs(prev_tcp->th_sport);
+					__u8 *res = bpf_map_lookup_elem(&entries, &prev_source_port);
+					if (!res) {
+						return XDP_PASS;
+					}
+					bpf_printk("prev_tcp");
+					struct entry *ent = (void *)res;
+					icmp->checksum = ipv4_csum_update_u16(icmp->checksum, prev_tcp->th_sport, ent->port);
+					icmp->checksum = ipv4_csum_update_u32(icmp->checksum, prev_ip->saddr, ent->addr);
+					prev_tcp->th_sport = ent->port;
+					prev_ip->saddr = ent->addr;
+					ip->daddr = ent->addr;
+					ip->check = 0;
+					__u64 sum = 0;
+					ipv4_csum_inline(ip, &sum);
+					ip->check = (__u16)sum;
+					return redirect(eth, out_mac, ent->mac_addr, *in_ifindex);
+
+
+				} else if (prev_ip->protocol == 0x11) {
+					struct udphdr *prev_udp = data;
+					if (data + sizeof(*prev_udp) > data_end) {
+						return XDP_PASS;
+					}
+					__u16 prev_source_port = ntohs(prev_udp->uh_sport);
+					__u8 *res = bpf_map_lookup_elem(&entries, &prev_source_port);
+					if (!res) {
+						return XDP_PASS;
+					}
+					bpf_printk("prev_udp port");
+					struct entry *ent = (void *)res;
+					icmp->checksum = ipv4_csum_update_u16(icmp->checksum, prev_udp->uh_sport, ent->port);
+					icmp->checksum = ipv4_csum_update_u32(icmp->checksum, prev_ip->saddr, ent->addr);
+					prev_udp->uh_sport = ent->port;
+					prev_ip->saddr = ent->addr;
+					ip->daddr = ent->addr;
+					ip->check = 0;
+					__u64 sum = 0;
+					ipv4_csum_inline(ip, &sum);
+					ip->check = (__u16)sum;
+					return redirect(eth, out_mac, ent->mac_addr, *in_ifindex);
+
+				} else {
+					return XDP_PASS;
+				}
 			}
 
 		} else if (ip->protocol == 0x06) {
