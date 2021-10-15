@@ -244,6 +244,10 @@ int nat_prog(struct xdp_md *ctx) {
 	if (data + sizeof(*ip) > data_end) {
 		return XDP_DROP;
 	}
+	ip->ttl--;
+	if (ip->ttl == 0) {
+		return XDP_PASS;
+	}
 	data += sizeof(*ip);
 	if (ingress_ifindex == *in_ifindex) {
 		// in
