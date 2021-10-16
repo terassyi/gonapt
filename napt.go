@@ -10,6 +10,7 @@ import (
 
 	"github.com/cilium/ebpf"
 	"github.com/vishvananda/netlink"
+	"github.com/vishvananda/netlink/nl"
 )
 
 const (
@@ -267,10 +268,10 @@ func (n *Napt) deleteEntry(key uint16, p peer) error {
 }
 
 func attach(prog *ebpf.Program, dev netlink.Link) error {
-	return netlink.LinkSetXdpFdWithFlags(dev, prog.FD(), 1 << 1)
+	return netlink.LinkSetXdpFdWithFlags(dev, prog.FD(), nl.XDP_FLAGS_SKB_MODE)
 	// return netlink.LinkSetXdpFd(dev, prog.FD())
 }
 
 func detach(dev netlink.Link) error {
-	return netlink.LinkSetXdpFd(dev, -1)
+	return netlink.LinkSetXdpFdWithFlags(dev, -1, nl.XDP_FLAGS_SKB_MODE)
 }
