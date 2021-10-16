@@ -131,7 +131,7 @@ static inline int lookup_route_table(struct xdp_md *ctx, struct bpf_fib_lookup *
 	fib_params->ifindex = ifindex;
 	int rc = bpf_fib_lookup(ctx, fib_params, sizeof(*fib_params), 0);
 	if ((rc != BPF_FIB_LKUP_RET_SUCCESS) && (rc != BPF_FIB_LKUP_RET_NO_NEIGH)) {
-		bpf_printk("fib lookup failed.");
+		bpf_printk("fib lookup failed %d.", rc);
 		return -1;
 	} else if (rc == BPF_FIB_LKUP_RET_NO_NEIGH) {
 		bpf_printk("fib lookup result is no neigh.");
@@ -244,11 +244,11 @@ int nat_prog(struct xdp_md *ctx) {
 	if (data + sizeof(*ip) > data_end) {
 		return XDP_DROP;
 	}
+	data += sizeof(*ip);
 	ip->ttl--;
 	if (ip->ttl == 0) {
 		return XDP_PASS;
 	}
-	data += sizeof(*ip);
 	if (ingress_ifindex == *in_ifindex) {
 		// in
 		// lookup route table
@@ -301,8 +301,9 @@ int nat_prog(struct xdp_md *ctx) {
 			// update tcp port
 			tcp->th_sport = htons(alloced_port);
 			// update ip field
-			ip->check = ipv4_csum_update_u32(ip->check, ip->saddr, *global_addr);
 			ip->saddr = *global_addr;
+			ip->check = 0;
+			ip->check = checksum((__u16 *)ip, sizeof(*ip));
 			// update tcp state
 			__u8 tcp_state = 0;
 			__u8 *res = bpf_map_lookup_elem(&entries, &alloced_port);
@@ -453,7 +454,11 @@ int nat_prog(struct xdp_md *ctx) {
 			// update dest port
 			tcp->th_dport = ent->port;
 			// update ip checksum
-			ip->check = ipv4_csum_update_u32(ip->check, ip->daddr, ent->addr);
+			ip->daddr = ent->addr;
+			ip->check = 0;
+			__u64 sum = 0;
+			ipv4_csum_inline(ip, &sum);
+			ip->check = (__u16)sum;
 			// update ip dest
 			ip->daddr = ent->addr;
 			struct peer p;
@@ -484,7 +489,11 @@ int nat_prog(struct xdp_md *ctx) {
 			udp->uh_sum = ipv4_csum_update_u16(udp->uh_sum, dest_port, udp->uh_dport);
 			udp->uh_sum = ipv4_csum_update_u32(udp->uh_sum, old_addr, ip->daddr);
 			// update ip checksum
-			ip->check = ipv4_csum_update_u32(ip->check, old_addr, ip->daddr);
+			ip->daddr = ent->addr;
+			ip->check = 0;
+			__u64 sum = 0;
+			ipv4_csum_inline(ip, &sum);
+			ip->check = (__u16)sum;
 			return redirect(eth, out_mac, ent->mac_addr, *in_ifindex);
 		} else {
 			return XDP_PASS;
