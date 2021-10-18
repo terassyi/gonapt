@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"log"
 	"net"
 	"os"
 	"os/signal"
@@ -34,6 +35,8 @@ type Napt struct {
 	gcMap map[uint16]*gcEntry
 	timeout time.Duration
 	tcpTimeout time.Duration
+	quitCh chan bool
+	serverQuitCh chan bool
 }
 
 type gcEntry struct {
@@ -70,6 +73,9 @@ func newNapt(in, out, global, local string) (*Napt, error) {
 	if err := spec.LoadAndAssign(collect, nil); err != nil {
 		return nil, err
 	}
+	if err := initLog(); err != nil {
+		return nil, err
+	}
 	return &Napt {
 		in: inL,
 		out: outL,
@@ -81,6 +87,7 @@ func newNapt(in, out, global, local string) (*Napt, error) {
 		gcMap: make(map[uint16]*gcEntry),
 		timeout: DEFAULT_TIMEOUT_HALF,
 		tcpTimeout: DEFAULT_TCP_TIMEOUT,
+		quitCh: make(chan bool),
 	}, nil
 }
 
@@ -115,6 +122,51 @@ func (n *Napt) Run() error {
 	}
 }
 
+func (n *Napt) RunBackGround() error {
+	fmt.Println("PID: ", getPid())
+	if err := n.Attach(); err != nil {
+		return err
+	}
+	if err := cleanup(); err != nil {
+		return err
+	}
+	listener, err := net.Listen(protocol, addr)
+	if err != nil {
+		return err
+	}
+	gcTicker := time.NewTicker(time.Second * 1)
+	go func() {
+		for {
+			select {
+			case <-gcTicker.C:
+				if err := n.GarbageCollection(); err != nil {
+					log.Println(err)
+				}
+			case <-n.quitCh:
+				if err := n.Detach(); err != nil {
+					log.Println(err)
+				}
+			}
+		}
+	}()
+
+	for {
+		conn, err := listener.Accept()
+		if err != nil {
+			log.Println(err)
+		}
+		exit, err := n.handleConn(conn)
+		if err != nil {
+			log.Println(err)
+		}
+		if exit {
+			time.Sleep(time.Second * 1)
+			break
+		}
+	}
+	return nil
+}
+
 func (n *Napt) Attach() error {
 	if err := attach(n.collect.Prog, n.in); err != nil {
 		return err
@@ -139,11 +191,9 @@ func (n *Napt) Detach() error {
 }
 
 func (n *Napt) Prepare() error {
-	fmt.Println("aa")
 	if err := n.collect.IfRedirectMap.Put(uint32(n.in.Attrs().Index), uint32(n.in.Attrs().Index)); err != nil {
 		return err
 	}
-	fmt.Println("bb")
 	if err := n.collect.IfRedirectMap.Put(uint32(n.out.Attrs().Index), uint32(n.out.Attrs().Index)); err != nil {
 		return err
 	}
@@ -162,16 +212,6 @@ func (n *Napt) Prepare() error {
 	if err := n.collect.IfMacMap.Put(uint32(n.out.Attrs().Index), []byte(n.out.Attrs().HardwareAddr)); err != nil {
 		return err
 	}
-
-	var (
-		key uint32
-		value uint32
-	)
-	iter := n.collect.IfRedirectMap.Iterate()
-	for iter.Next(&key, &value) {
-		fmt.Printf("key = %d value = %d\n", key, value)
-	}
-
 	return nil
 }
 
@@ -274,4 +314,23 @@ func attach(prog *ebpf.Program, dev netlink.Link) error {
 
 func detach(dev netlink.Link) error {
 	return netlink.LinkSetXdpFdWithFlags(dev, -1, nl.XDP_FLAGS_SKB_MODE)
+}
+
+func (n *Napt) lookupEntry() ([]tableEntry, error) {
+	entries := make([]tableEntry, 0, 1024)
+	var (
+		key uint16
+		value [22]byte
+	)
+
+	iter := n.collect.Entries.Iterate()
+	for iter.Next(&key, &value) {
+		entry, err := entryFromBytes(value)
+		if err != nil {
+			return nil, err
+		}
+		entry.global = key
+		entries = append(entries, entry.toTableEntry())
+	}
+	return entries, nil
 }

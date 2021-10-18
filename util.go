@@ -1,8 +1,9 @@
 package main
 
 import (
-	"net"
 	"encoding/binary"
+	"net"
+	"os"
 )
 
 func putUint32ToUint64(a, b uint32) uint64 {
@@ -23,4 +24,8 @@ func toLittleEndian(big []byte) []byte {
 		li[len(big) - i - 1] = b
 	}
 	return li
+}
+
+func getPid() int {
+	return os.Getpid()
 }
