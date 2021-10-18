@@ -4,6 +4,10 @@ import (
 	"encoding/binary"
 	"fmt"
 	"net"
+	"os"
+	"strconv"
+
+	"github.com/olekukonko/tablewriter"
 )
 
 type peer struct {
@@ -19,6 +23,20 @@ type entry struct {
 	flag uint8
 	macAddr []byte // 6 byte
 	timestamp uint64
+}
+
+func (e *entry) toTableEntry() tableEntry {
+	te := tableEntry {
+		Global: int(e.global),
+		PeerAddr: e.addr.String(),
+		PeerPort: int(e.port),
+		Protocol: int(e.protocol),
+		MacAddr: fmt.Sprintf("%02x:%02x:%02x:%02x:%02x:%02x", e.macAddr[0], e.macAddr[1], e.macAddr[2], e.macAddr[3], e.macAddr[4], e.macAddr[5]),
+	}
+	if e.protocol == 0x06 {
+		te.State = tcpStateString(e.protocol)
+	}
+	return te
 }
 
 func peerFromBytes(data [6]byte) peer {
@@ -51,6 +69,7 @@ func entryFromBytes(data [22]byte) (*entry, error) {
 	return e, nil
 }
 
+
 func (e *entry) String() string {
 	macAddrStr := fmt.Sprintf("%02x:%02x:%02x:%02x:%02x:%02x", e.macAddr[0], e.macAddr[1], e.macAddr[2], e.macAddr[3], e.macAddr[4], e.macAddr[5])
 	tcpState := ""
@@ -72,4 +91,38 @@ func protoString(protocol uint8) string {
 	default:
 		return "UNKNOWN"
 	}
+}
+
+type tableRequest struct {
+	SubCommand string `json:"subcommand"`
+}
+
+type tableResponse struct {
+	Entries []tableEntry `json:"entries"`
+}
+
+type tableEntry struct {
+	Global int `json:"global"`
+	PeerAddr string `json:"peer_addr"`
+	PeerPort int `json:"peer_port"`
+	MacAddr string `json:"mac_addr"`
+	Protocol int `json:"protocol"`
+	State string `json:"state,omitempty"`
+}
+
+func (tr *tableResponse) show() {
+	data := [][]string{}
+	for _, e := range tr.Entries {
+		data = append(data, []string{strconv.Itoa(e.Global), e.PeerAddr, strconv.Itoa(e.PeerPort), e.MacAddr, protoString(uint8(e.Protocol)), e.State})
+	}
+	table := tablewriter.NewWriter(os.Stdout)
+	table.SetHeader([]string{"GLOBAL PORT", "PEER ADDR", "PEER PORT", "MAC ADDR", "PROTOCOL", "STATE"})
+	table.SetBorders(tablewriter.Border{ Left: true, Top: true, Right: true, Bottom: true })
+	table.SetCenterSeparator("|")
+	table.AppendBulk(data)
+	table.Render()
+}
+
+func (te tableEntry) show() string {
+	return fmt.Sprintf("")
 }
