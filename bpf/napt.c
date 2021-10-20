@@ -226,14 +226,15 @@ int nat_prog(struct xdp_md *ctx) {
 	if (eth->h_proto == 0x0608) {
 		// arp
 		// proxy arp handle
-		struct arphdr *arp = data;
-		if (data + sizeof(*arp) > data_end) {
-			return XDP_DROP;
-		}
-		if (ingress_ifindex != *in_ifindex) {
-			return XDP_PASS;
-		}
-		return proxy_arp(arp, eth,in_mac, global_addr);
+		// struct arphdr *arp = data;
+		// if (data + sizeof(*arp) > data_end) {
+		// 	return XDP_DROP;
+		// }
+		// if (ingress_ifindex != *in_ifindex) {
+		// 	return XDP_PASS;
+		// }
+		// return proxy_arp(arp, eth,in_mac, global_addr);
+		return XDP_PASS;
 	}
 	if (eth->h_proto != 0x08U) {
 		// not ipv4

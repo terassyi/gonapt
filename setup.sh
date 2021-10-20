@@ -72,6 +72,8 @@ if [ "$BUILD" = "$1" ]; then
 	sudo ip route add 138.76.29.0/24 via 138.76.28.1 dev np-w
 	sudo ip netns exec router ip route add default via 138.76.29.254
 	sudo ip netns exec srv ip route add default via 138.76.29.254
+	
+	ping -c 1 138.76.29.7 > /dev/null
 
 
 elif [ "$CLEAN" = "$1" ]; then
