@@ -45,7 +45,7 @@ BPF_MAP_DEF(if_addr) = {
 	.value_size = sizeof(__u32),
 	.max_entries = 64,
 };
-BPF_MAP_ADD(if_mac);
+BPF_MAP_ADD(if_addr);
 
 BPF_MAP_DEF(entries) = {
 	.map_type = BPF_MAP_TYPE_HASH,
